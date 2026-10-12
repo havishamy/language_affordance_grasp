@@ -1,0 +1,28 @@
+[project]
+name = "language-affordance-grasp"
+version = "0.1.0"
+description = "Language-conditioned affordance projection and GraspNet workspace orchestration."
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "Pillow",
+  "PyYAML",
+  "trimesh",
+]
+
+[project.optional-dependencies]
+api = [
+  "fastapi>=0.121",
+  "python-multipart>=0.0.20",
+  "uvicorn>=0.38",
+]
+client = [
+  "requests>=2.32",
+]
+
+[project.scripts]
+lag = "language_affordance_grasp.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

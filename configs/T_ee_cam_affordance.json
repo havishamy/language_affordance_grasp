@@ -1,0 +1,16 @@
+{
+  "status": "confirmed",
+  "units": "meters",
+  "ee_frame": "tool0",
+  "world_frame": "base",
+  "camera_coordinate_convention": "opencv_optical_x_right_y_down_z_forward",
+  "original_tracking_base_frame_label": "camera_color_frame",
+  "direction_basis": "User-supplied eye_on_hand=true result and actual launch; standard aruco_ros single behavior with camera_frame equal to reference_frame retains optical coordinates despite the frame label.",
+  "physical_accuracy_validated": false,
+  "T_ee_cam": [
+    [0.9994851652803807, -0.02478095244514724, 0.02037912609415344, -0.004562593505863851],
+    [0.017709599774772947, 0.9557538131034896, 0.2936341581184945, -0.11592850154128732],
+    [-0.026753961580809234, -0.29312207889214187, 0.9557006186069367, 0.003180012183660791],
+    [0.0, 0.0, 0.0, 1.0]
+  ]
+}
