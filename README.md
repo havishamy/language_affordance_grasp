@@ -1,5 +1,8 @@
 # Language Affordance Grasp
 
+玻璃棒最终搅拌阶段使用独立的 CPU 几何定位接口（不运行 SAM3D）。服务器/本地输入输出契约和本地机械臂配合要求见
+[`STIRRING_LOCAL_INTEGRATION_PROMPT.md`](STIRRING_LOCAL_INTEGRATION_PROMPT.md)。
+
 本地采集、数据上传、服务器运行和结果下载的完整交接说明见 `README_LOCAL_CAPTURE_AND_TRANSFER.md`。HTTP 任务接口和本地客户端说明见 `README_LOCAL_SERVER_API.md`。
 
 把三个已有项目串成一条离线可回放链路：

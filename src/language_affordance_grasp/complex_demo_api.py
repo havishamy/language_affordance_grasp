@@ -3,8 +3,10 @@ from __future__ import annotations
 import hmac
 import hashlib
 import json
+import math
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -35,15 +37,17 @@ from language_affordance_grasp.titration_api import (
 )
 
 
-Workflow = Literal["titration", "complex_demo"]
+Workflow = Literal["titration", "complex_demo", "stirring"]
 
 
 @dataclass(frozen=True)
 class ApiSettings:
     titration_run_root: Path
     complex_run_root: Path
+    stirring_run_root: Path
     titration_pipeline_script: Path
     complex_pipeline_script: Path
+    stirring_pipeline_script: Path
     calibration_path: Path
     api_token: str
     max_image_bytes: int = 64 * 1024 * 1024
@@ -58,11 +62,15 @@ class ApiSettings:
                 os.environ.get("LAG_TITRATION_RUN_ROOT", os.environ.get("LAG_API_RUN_ROOT", str(repo / "runs" / "api_jobs")))
             ),
             complex_run_root=Path(os.environ.get("LAG_COMPLEX_DEMO_RUN_ROOT", str(repo / "runs" / "complex_demo_jobs"))),
+            stirring_run_root=Path(os.environ.get("LAG_STIRRING_RUN_ROOT", str(repo / "runs" / "stirring_jobs"))),
             titration_pipeline_script=Path(
                 os.environ.get("LAG_TITRATION_PIPELINE", str(repo / "scripts" / "run_titration_two_object.sh"))
             ),
             complex_pipeline_script=Path(
                 os.environ.get("LAG_COMPLEX_DEMO_PIPELINE", str(repo / "scripts" / "run_complex_demo_three_object.sh"))
+            ),
+            stirring_pipeline_script=Path(
+                os.environ.get("LAG_STIRRING_PIPELINE", str(repo / "scripts" / "run_glass_rod_stirring.sh"))
             ),
             calibration_path=Path(calibration) if calibration else Path(""),
             api_token=os.environ.get("LAG_API_TOKEN", ""),
@@ -81,8 +89,11 @@ class ApiSettings:
         ).validate()
         if not self.complex_pipeline_script.is_file():
             raise RuntimeError(f"Complex-demo pipeline script not found: {self.complex_pipeline_script}")
-        if self.titration_run_root.resolve() == self.complex_run_root.resolve():
-            raise RuntimeError("Titration and complex-demo run roots must be different")
+        if not self.stirring_pipeline_script.is_file():
+            raise RuntimeError(f"Stirring pipeline script not found: {self.stirring_pipeline_script}")
+        roots = {self.titration_run_root.resolve(), self.complex_run_root.resolve(), self.stirring_run_root.resolve()}
+        if len(roots) != 3:
+            raise RuntimeError("Titration, complex-demo, and stirring run roots must be different")
 
 
 class PipelineJobError(RuntimeError):
@@ -99,10 +110,15 @@ class UnifiedJobManager:
         self._roots = {
             "titration": settings.titration_run_root,
             "complex_demo": settings.complex_run_root,
+            "stirring": settings.stirring_run_root,
         }
         for root in self._roots.values():
             root.mkdir(parents=True, exist_ok=True)
-        self._jobs: dict[Workflow, dict[str, dict[str, Any]]] = {"titration": {}, "complex_demo": {}}
+        self._jobs: dict[Workflow, dict[str, dict[str, Any]]] = {
+            "titration": {},
+            "complex_demo": {},
+            "stirring": {},
+        }
         self._lock = threading.RLock()
         self._queue: queue.Queue[tuple[Workflow, str]] = queue.Queue()
         self._load_existing_jobs()
@@ -138,7 +154,7 @@ class UnifiedJobManager:
                             "code": "SERVER_RESTARTED",
                             "message": "API server restarted while this job was pending or running; resubmit the capture.",
                         }
-                        if workflow == "complex_demo"
+                        if workflow in {"complex_demo", "stirring"}
                         else "API server restarted while this job was pending or running; resubmit the capture.",
                     )
                     write_json(status_path, payload)
@@ -197,12 +213,14 @@ class UnifiedJobManager:
             try:
                 if workflow == "titration":
                     self._run_titration(job_id)
-                else:
+                elif workflow == "complex_demo":
                     self._run_complex_demo(job_id)
+                else:
+                    self._run_stirring(job_id)
             except PipelineJobError as exc:
                 self.update(workflow, job_id, state="failed", error=exc.error, failed_at=utc_now())
             except Exception as exc:
-                if workflow == "complex_demo":
+                if workflow in {"complex_demo", "stirring"}:
                     error: Any = {
                         "stage": "api_worker",
                         "object": None,
@@ -224,7 +242,7 @@ class UnifiedJobManager:
             process = subprocess.run(command, stdout=log_handle, stderr=subprocess.STDOUT, check=False)
         if process.returncode == 0:
             return
-        if workflow == "complex_demo":
+        if workflow in {"complex_demo", "stirring"}:
             failure_path = job_dir / "output" / "failure.json"
             if failure_path.is_file():
                 try:
@@ -338,6 +356,63 @@ class UnifiedJobManager:
             error=None,
         )
 
+    def _run_stirring(self, job_id: str) -> None:
+        job = self.get("stirring", job_id)
+        job_dir = self.job_dir("stirring", job_id)
+        input_dir = job_dir / "inputs"
+        output_dir = job_dir / "output"
+        metadata = job["metadata"]
+        command = [
+            str(self.settings.stirring_pipeline_script),
+            "--rgb", str(input_dir / "rgb.png"),
+            "--depth", str(input_dir / "depth.png"),
+            "--intrinsics", str(input_dir / "camera.json"),
+            "--calibration", str(self.settings.calibration_path),
+            "--world-ee", str(input_dir / "T_world_ee.json"),
+            "--depth-scale", str(metadata["depth_scale"]),
+            "--capture-id", metadata["capture_id"],
+            "--job-id", job_id,
+            "--output-dir", str(output_dir),
+            "--rod-radius-m", str(metadata["rod_radius_m"]),
+            "--grasp-inset-m", str(metadata["grasp_inset_m"]),
+            "--min-length-m", str(metadata["min_length_m"]),
+            "--max-length-m", str(metadata["max_length_m"]),
+        ]
+        self._run_subprocess("stirring", job_id, command)
+        result_path = output_dir / "result.json"
+        if not result_path.is_file():
+            raise PipelineJobError(
+                {
+                    "stage": "geometry_export",
+                    "object": "glass_rod",
+                    "region": None,
+                    "code": "MISSING_RESULT_JSON",
+                    "message": f"Stirring pipeline completed without {result_path}",
+                }
+            )
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        validate_stirring_result(output_dir, result, job_id, metadata)
+        completed_at = utc_now()
+        job = self.get("stirring", job_id)
+        job_document = {
+            **job,
+            "state": "completed",
+            "updated_at": completed_at,
+            "completed_at": completed_at,
+            "error": None,
+            "result": {"result_json": "output/result.json"},
+        }
+        write_json(output_dir / "job.json", job_document)
+        build_stirring_bundle(job_dir)
+        self.update(
+            "stirring",
+            job_id,
+            state="completed",
+            result={"result_json": "output/result.json"},
+            completed_at=completed_at,
+            error=None,
+        )
+
 
 COMPLEX_REQUIRED_ARTIFACTS = (
     "result.json",
@@ -379,6 +454,17 @@ COMPLEX_REQUIRED_ARTIFACTS = (
     "overlays/affordance_overlay.png",
 )
 
+STIRRING_REQUIRED_ARTIFACTS = (
+    "result.json",
+    "job.json",
+    "pipeline.log",
+    "00_segmentation/glass_rod/mask.png",
+    "00_segmentation/glass_rod/mask_prob.png",
+    "00_segmentation/glass_rod/overlay.png",
+    "00_segmentation/glass_rod/detections.json",
+    "glass_rod/geometry_overlay.png",
+)
+
 
 def _safe_output_artifact(output_dir: Path, relative: str) -> Path:
     relative_path = Path(relative)
@@ -388,6 +474,68 @@ def _safe_output_artifact(output_dir: Path, relative: str) -> Path:
     if output_dir.resolve() not in path.parents:
         raise ValueError(f"Artifact escapes output directory: {relative}")
     return path
+
+
+def _finite_vector(value: Any, length: int, label: str) -> list[float]:
+    if not isinstance(value, list) or len(value) != length:
+        raise ValueError(f"{label} must be a list of length {length}")
+    result = [float(item) for item in value]
+    if not all(math.isfinite(item) for item in result):
+        raise ValueError(f"{label} contains NaN or Inf")
+    return result
+
+
+def validate_stirring_result(
+    output_dir: Path,
+    result: dict[str, Any],
+    job_id: str,
+    metadata: dict[str, Any],
+) -> None:
+    if result.get("schema_version") != "stirring-geometry-v1":
+        raise ValueError("Unsupported stirring result schema")
+    if result.get("job_id") != job_id or result.get("capture_id") != metadata["capture_id"]:
+        raise ValueError("Stirring result job_id/capture_id does not match the queued job")
+    if result.get("frame") != "world" or result.get("units") != "meters":
+        raise ValueError("Stirring result must use world coordinates in meters")
+    rod = result.get("glass_rod")
+    if not isinstance(rod, dict):
+        raise ValueError("Stirring result is missing glass_rod")
+    endpoint_a = _finite_vector(rod.get("endpoint_a_world"), 3, "endpoint_a_world")
+    endpoint_b = _finite_vector(rod.get("endpoint_b_world"), 3, "endpoint_b_world")
+    _finite_vector(rod.get("center_world"), 3, "center_world")
+    axis = _finite_vector(rod.get("axis_world_unoriented"), 3, "axis_world_unoriented")
+    measured_length = math.dist(endpoint_a, endpoint_b)
+    declared_length = float(rod.get("length_m", float("nan")))
+    if not math.isfinite(declared_length) or abs(measured_length - declared_length) > 1e-5:
+        raise ValueError("Glass-rod endpoints and length_m are inconsistent")
+    if not metadata["min_length_m"] <= declared_length <= metadata["max_length_m"]:
+        raise ValueError("Glass-rod length is outside the submitted safety range")
+    axis_norm = math.sqrt(sum(value * value for value in axis))
+    if abs(axis_norm - 1.0) > 1e-4:
+        raise ValueError("axis_world_unoriented is not unit length")
+    candidates = rod.get("grasp_candidates")
+    if not isinstance(candidates, list) or [item.get("id") for item in candidates] != ["grasp_near_a", "grasp_near_b"]:
+        raise ValueError("Stirring result must contain the two ordered grasp candidates")
+    for index, candidate in enumerate(candidates):
+        _finite_vector(candidate.get("grasp_point_world"), 3, f"grasp_candidates[{index}].grasp_point_world")
+        _finite_vector(candidate.get("opposite_tip_world"), 3, f"grasp_candidates[{index}].opposite_tip_world")
+        _finite_vector(
+            candidate.get("rod_direction_grasp_to_tip_world"),
+            3,
+            f"grasp_candidates[{index}].rod_direction_grasp_to_tip_world",
+        )
+    quality = rod.get("quality")
+    if not isinstance(quality, dict) or quality.get("valid") is not True:
+        raise ValueError("Glass-rod geometry quality is not valid")
+    for artifact_key in (
+        "mask_artifact",
+        "mask_probability_artifact",
+        "segmentation_overlay_artifact",
+        "geometry_overlay_artifact",
+    ):
+        relative = rod.get(artifact_key)
+        if not isinstance(relative, str) or not _safe_output_artifact(output_dir, relative).is_file():
+            raise ValueError(f"Missing stirring artifact {artifact_key}: {relative}")
 
 
 def validate_complex_result(
@@ -562,6 +710,29 @@ def build_complex_bundle(job_dir: Path, scope: str) -> Path:
     return bundle_path
 
 
+def build_stirring_bundle(job_dir: Path) -> Path:
+    output_dir = job_dir / "output"
+    bundle_path = job_dir / "results_bundle.zip"
+    for relative in STIRRING_REQUIRED_ARTIFACTS:
+        path = _safe_output_artifact(output_dir, relative)
+        if not path.is_file():
+            raise FileNotFoundError(f"Required stirring artifact is missing: {relative}")
+    selected: list[tuple[Path, str]] = []
+    for path in output_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(output_dir)
+        if relative.parts[0] in {".config", ".matplotlib"}:
+            continue
+        selected.append((path, relative.as_posix()))
+    temporary = bundle_path.with_suffix(".zip.tmp")
+    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+        for path, archive_name in sorted(selected, key=lambda pair: pair[1]):
+            archive.write(path, arcname=archive_name)
+    temporary.replace(bundle_path)
+    return bundle_path
+
+
 def _decode_request_json(value: str, label: str) -> Any:
     try:
         return json.loads(value)
@@ -574,6 +745,28 @@ def _validate_common_form(depth_scale: float, gpu: int | None) -> None:
         raise HTTPException(status_code=400, detail="depth_scale must be in (0, 1]")
     if gpu is not None and not (0 <= gpu <= 63):
         raise HTTPException(status_code=400, detail="gpu must be a non-negative physical GPU index")
+
+
+def _validate_stirring_form(
+    capture_id: str,
+    rod_radius_m: float,
+    grasp_inset_m: float,
+    min_length_m: float,
+    max_length_m: float,
+) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", capture_id):
+        raise HTTPException(status_code=400, detail="capture_id contains unsupported characters")
+    values = {
+        "rod_radius_m": rod_radius_m,
+        "grasp_inset_m": grasp_inset_m,
+        "min_length_m": min_length_m,
+        "max_length_m": max_length_m,
+    }
+    for label, value in values.items():
+        if not math.isfinite(value) or value <= 0.0:
+            raise HTTPException(status_code=400, detail=f"{label} must be finite and positive")
+    if min_length_m >= max_length_m:
+        raise HTTPException(status_code=400, detail="min_length_m must be less than max_length_m")
 
 
 async def _save_four_uploads(
@@ -597,7 +790,7 @@ async def _save_four_uploads(
 
 def create_app(settings: ApiSettings | None = None) -> FastAPI:
     settings = settings or ApiSettings.from_env()
-    app = FastAPI(title="Language Affordance Unified Titration and Complex Demo API", version="2.0")
+    app = FastAPI(title="Language Affordance Unified Lab Demo API", version="2.1")
     manager_holder: dict[str, UnifiedJobManager] = {}
 
     async def authorize(authorization: str | None = Header(default=None)) -> None:
@@ -621,8 +814,9 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
             "calibration_path": str(settings.calibration_path),
             "titration_run_root": str(settings.titration_run_root),
             "complex_demo_run_root": str(settings.complex_run_root),
+            "stirring_run_root": str(settings.stirring_run_root),
             "worker_count": 1,
-            "queue": "shared_by_titration_and_complex_demo",
+            "queue": "shared_by_titration_complex_demo_and_stirring",
         }
 
     @app.post("/v1/titration/jobs", status_code=202)
@@ -784,6 +978,83 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=f"Job state is {job['state']}")
         bundle = build_complex_bundle(job_dir, scope)
         return FileResponse(bundle, media_type="application/zip", filename=f"complex_demo_{job_id}_{scope}.zip")
+
+    @app.post("/v1/stirring/jobs", status_code=202)
+    async def submit_stirring_job(
+        rgb: UploadFile = File(...),
+        depth: UploadFile = File(...),
+        camera: UploadFile = File(...),
+        world_ee: UploadFile = File(...),
+        depth_scale: float = Form(0.001),
+        capture_id: str = Form(...),
+        rod_radius_m: float = Form(0.0025),
+        grasp_inset_m: float = Form(0.025),
+        min_length_m: float = Form(0.08),
+        max_length_m: float = Form(0.40),
+        _: None = Depends(authorize),
+        jobs: UnifiedJobManager = Depends(manager),
+    ) -> dict[str, Any]:
+        _validate_common_form(depth_scale, None)
+        _validate_stirring_form(capture_id, rod_radius_m, grasp_inset_m, min_length_m, max_length_m)
+        metadata = {
+            "capture_id": capture_id,
+            "depth_scale": depth_scale,
+            "rod_radius_m": rod_radius_m,
+            "grasp_inset_m": grasp_inset_m,
+            "min_length_m": min_length_m,
+            "max_length_m": max_length_m,
+            "compute": "cpu_mask_pca_table_plane",
+        }
+        job = jobs.create_job("stirring", metadata)
+        job_id = job["job_id"]
+        try:
+            sizes = await _save_four_uploads(settings, jobs, "stirring", job_id, rgb, depth, camera, world_ee)
+        except Exception:
+            jobs.remove_failed_upload("stirring", job_id)
+            raise
+        jobs.update("stirring", job_id, upload_sizes=sizes)
+        queued = jobs.enqueue("stirring", job_id)
+        return {"job_id": queued["job_id"], "state": queued["state"]}
+
+    @app.get("/v1/stirring/jobs/{job_id}")
+    async def get_stirring_job(
+        job_id: str, _: None = Depends(authorize), jobs: UnifiedJobManager = Depends(manager)
+    ) -> dict[str, Any]:
+        try:
+            return jobs.get("stirring", job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Job not found") from exc
+
+    @app.get("/v1/stirring/jobs/{job_id}/result")
+    async def get_stirring_result(
+        job_id: str, _: None = Depends(authorize), jobs: UnifiedJobManager = Depends(manager)
+    ) -> dict[str, Any]:
+        try:
+            job = jobs.get("stirring", job_id)
+            result_path = jobs.job_dir("stirring", job_id) / "output" / "result.json"
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Job not found") from exc
+        if job["state"] != "completed":
+            raise HTTPException(status_code=409, detail=f"Job state is {job['state']}")
+        if not result_path.is_file():
+            raise HTTPException(status_code=500, detail="Completed stirring job is missing result.json")
+        return json.loads(result_path.read_text(encoding="utf-8"))
+
+    @app.get("/v1/stirring/jobs/{job_id}/bundle")
+    async def download_stirring_bundle(
+        job_id: str,
+        _: None = Depends(authorize),
+        jobs: UnifiedJobManager = Depends(manager),
+    ) -> FileResponse:
+        try:
+            job = jobs.get("stirring", job_id)
+            job_dir = jobs.job_dir("stirring", job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Job not found") from exc
+        if job["state"] != "completed":
+            raise HTTPException(status_code=409, detail=f"Job state is {job['state']}")
+        bundle = build_stirring_bundle(job_dir)
+        return FileResponse(bundle, media_type="application/zip", filename=f"stirring_{job_id}_results.zip")
 
     return app
 

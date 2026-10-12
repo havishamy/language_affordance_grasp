@@ -22,6 +22,7 @@ fi
 export PYTHONPATH="$LAG_REPO/src"
 export LAG_TITRATION_RUN_ROOT="${LAG_TITRATION_RUN_ROOT:-${LAG_API_RUN_ROOT:-$LAG_REPO/runs/api_jobs}}"
 export LAG_COMPLEX_DEMO_RUN_ROOT="${LAG_COMPLEX_DEMO_RUN_ROOT:-$LAG_REPO/runs/complex_demo_jobs}"
+export LAG_STIRRING_RUN_ROOT="${LAG_STIRRING_RUN_ROOT:-$LAG_REPO/runs/stirring_jobs}"
 
 cd "$LAG_REPO"
 exec "$LAG_API_PYTHON" -m uvicorn language_affordance_grasp.complex_demo_api:app \
